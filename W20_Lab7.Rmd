@@ -1,0 +1,546 @@
+---
+title: "Lab 7 - Community Analysis Part 1"
+author: "Kristi Gdanetz MacCready"
+date: "02/10/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "~/Box Sync/Schmidt_Lab/Bio201_teaching/W20_Protocols/Lab7/")
+```
+
+# Load packages
+```{r Load packages, eval=TRUE, echo=TRUE, message=FALSE, warning=FALSE, results='hide'}
+library(vegan)
+library(tidyverse)
+library(readxl)
+library(broom)
+library(cowplot)
+library(phyloseq); packageVersion("phyloseq")
+set.seed(7)
+source("~/Documents/GitHub/DenefLab-MicrobeMiseq/R/miseqR.R")
+```
+
+```{r}
+myfunction <- function(x) {
+  x = round ( x*1000 , digits = 0 )
+}
+```
+
+# Import data
+
+Import shared table and format for phyloseq. Phyloseq works by matching rownames across matrix objects (This is similar to how we matched columns in joins of data frames). A two-dimensional matrix in R looks just like a data frame, however R matrices can be three-dimensional. A three-dimensional object is created when multiple two-dimensional objects are combined (we'll work through this in the upcoming sections). 
+
+```{r}
+shared_m <- read_delim("raw_data/MMP_thruf19_filtered.shared",
+                            delim = "\t", escape_double = FALSE, 
+                            trim_ws = TRUE, na=c("NA"),
+                            col_types = list()) %>%
+  # separate Group column by underscores
+  separate(col = Group, 
+           into = c("participant_id", "sample_number", "seq_num"),
+           sep = "_", extra = "drop") %>%
+  # combine columns to make new sample id column 
+  mutate(sample_id = paste(participant_id, sample_number, sep = "_")) %>% 
+  # drop extra columns, reorder columns
+  select(sample_id, starts_with("Otu")) %>%
+  # drop control samples from sequencing
+  filter(str_detect(sample_id, "^U")) %>%
+  # remove duplicate sample ids
+  distinct(sample_id, .keep_all = TRUE) %>% 
+  # sample IDs need to be made into row names
+  column_to_rownames(var = "sample_id") %>% 
+  # convert data frame to matrix object
+  as.matrix() %>% 
+  # convert to phyloseq object 
+  otu_table(., taxa_are_rows = FALSE) 
+```
+
+Import taxonomy table and format for phyloseq.
+```{r}
+taxa_m <- read_delim("raw_data/MMP_thruf19.taxonomy",
+                            delim = "\t", escape_double = FALSE, 
+                            trim_ws = TRUE, na=c("NA")) %>%
+  # sequence variants (OTUs) need to be made into row names 
+  column_to_rownames(var = "ESV") %>% 
+  as.matrix() %>%
+  # convert to phyloseq object 
+  tax_table()  
+```
+
+Import sample data and format for phyloseq.
+```{r}
+samples_m <- read_delim("raw_data/all_data_indv.txt", 
+                            delim = "\t", escape_double = FALSE, 
+                            trim_ws = TRUE, 
+                            col_types = cols(Sample_number = col_character(),
+                                             Bristol_numeric = col_number(),
+                                             Bristol_score = col_character(), 
+                                             pH = col_number())) %>%
+  # make all column names lower case
+  rename_all(tolower) %>% 
+  # remove duplicate sample ids
+  distinct(., sample_id, .keep_all = TRUE) %>%  
+  # sample IDs need to be made into row names
+  column_to_rownames(var = "sample_id") %>% 
+  # specify type of phyloseq object
+  sample_data() 
+```
+
+Import sample data as data frame for later analyses
+
+```{r}
+# format sample data 
+samples_df <- read_delim("raw_data/all_data_indv.txt", 
+                            delim = "\t", escape_double = FALSE, 
+                            trim_ws = TRUE, 
+                            col_types = cols(Sample_number = col_character(),
+                                             Bristol_numeric = col_number(),
+                                             Bristol_score = col_character(), 
+                                             pH = col_number())) %>%
+  # make all column names lower case
+  rename_all(tolower) %>% 
+  # remove duplicate sample ids
+  distinct(., sample_id, .keep_all = TRUE) %>%  
+  # subset for samples, semesters, weeks of interest 
+  filter(use_data == "yes", 
+         quantity_compliant != "no",
+         semester != "Winter2015",
+         study_week == "week1" | study_week == "week3",
+         supplement_consumed == "BRMPS" | supplement_consumed == "LOODAT")
+```
+
+
+# Create phyloseq objects
+Phyloseq is an R package that has a suite of functions that make microbial community anaylsis a bit simpler. https://joey711.github.io/phyloseq/index.html It requires the data to be structured in three critical files (1) sequence variant (or OTU) table that contains counts of each sequence; (2) Taxanomic information that contains classifications from Phylum to species for each sequence variant; (3) sample information, which is the participant information we have been working with so far this semester. We imported these three files in the section above, now we have to combine them into one object. 
+```{r}
+# combine three phyloseq objects created above
+physq_obj <- phyloseq(shared_m, taxa_m, samples_m) %>% 
+  # subset for consent and compliance
+  subset_samples(., use_data == "yes") %>%
+  subset_samples(., quantity_compliant != "no") %>%
+  # remove problematic semester(s)
+  subset_samples(., semester != "Winter2015") %>% 
+  # subset for weeks of interest
+  subset_samples(., study_week == "week1" | study_week == "week3") %>%
+  # subset for potato supplements 
+  subset_samples(., supplement_consumed == "BRMPS" | supplement_consumed == "LOODAT")
+
+physq_obj #view dimentions of new object 
+```
+
+# Visualize taxa
+
+### Avg Phyla Rel Abund 
+Before we plot the OTUs, we have to combine the counts from each week into a single average. 
+```{r}
+physq_phyla <- physq_obj %>% 
+  # tax glom groups together taxa with the same name
+  tax_glom("Phylum") %>%
+  # convert counts to relative abundance 
+  transform_sample_counts(function(x) {x/sum(x)} ) %>%
+  # convert phyloseq object (matrix) to data frame 
+  psmelt() %>%
+  # sort alphabetically 
+  arrange(Phylum) %>%
+  # Calculate weekly mean of relative abundance
+  group_by(participant_id, study_week, semester, 
+           frequency, supplement_consumed, Phylum, OTU) %>%
+  summarise(relative_abundance = mean(Abundance, na.rm = TRUE)) %>%
+  # remove low abundance taxa
+  filter(relative_abundance > 0.001)
+```
+
+### LOODAT plot 
+The code below filters for participants who consumed LOODAT potato starch, then plots the relative abundance of each phyla found in each participant. 
+```{r}
+ld3_plot <- physq_phyla %>%
+  # filter for supplement and study week 
+  filter(supplement_consumed == "LOODAT",
+         study_week == "week3") %>% 
+  # set parameters for plot
+  ggplot(aes(x = participant_id, y = relative_abundance,
+             fill = Phylum,
+             study_week, frequency)) + 
+  # layer for stacked bar plot 
+  geom_bar(stat = "identity") +
+  # clean up x-axis 
+  theme(axis.title.x = element_blank(), #remove x-axis label 
+        axis.text.x =  element_text(angle = 90, #rotate tick labels 
+                                    vjust = 0.5,
+                                    hjust = 0.5,
+                                    size = 8)) +
+  # clean up y-axis
+  ylab("Relative Abundance\n(% total sequences)") +
+  ggtitle("Week 3 - LOODAT")
+ld3_plot
+```
+
+### BRMPS 1x plot 
+The code below filters for participants who consumed BRMPS once a day, then plots the relative abundance of each phyla found in each participant. 
+```{r}
+brm1_plot <- physq_phyla %>%
+  filter(supplement_consumed == "BRMPS",
+         frequency == "1xdaily",
+         study_week == "week3") %>% 
+  ggplot(aes(x = participant_id, y = relative_abundance,
+             fill = Phylum,
+             study_week, frequency)) + 
+  geom_bar(stat = "identity") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x =  element_text(angle = 90,
+                                    vjust = 0.5,
+                                    hjust = 0.5,
+                                    size = 8)) +
+  ylab("Relative Abundance\n(% total sequences)") +
+  ggtitle("Week 3 - BRMPS 1xdaily")
+brm1_plot
+```
+
+### BRMPS 2x plot 
+The section filters for participants who consumed BRMPS twice a day, then plots the relative abundance of each phyla found in each participant. 
+```{r}
+brm2_plot <- physq_phyla %>%
+  filter(supplement_consumed == "BRMPS",
+         frequency == "2xdaily",
+         study_week == "week3") %>% 
+  ggplot(aes(x = participant_id, y = relative_abundance,
+             fill = Phylum,
+             study_week, frequency)) + 
+  geom_bar(stat = "identity") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x =  element_text(angle = 90,
+                                    vjust = 0.5,
+                                    hjust = 0.5,
+                                    size = 8)) +
+  ylab("Relative Abundance\n(% total sequences)") +
+  ggtitle("Week 3 - BRMPS 2xdaily")
+brm2_plot
+```
+
+### Combine plots 
+We would like to see if the consumption of different brands of potato starches results in different community composition. The easiest way to do this would be to place the barplots side by side. 
+```{r}
+plot_1day <- plot_grid(ld3_plot, brm1_plot,
+          nrow = 1, ncol = 2)
+plot_1day
+```
+Expand the plot window to view the plot. Notice that there is a different number of phyla in each figure, with ggplot default colors this means the same group (e.g. Bacteroidetes) doesn't show up as the same color. We can replace these colors with a standard color palette. 
+```{r}
+phylum_colors_L <- c("#00767d", "#d38665", "#0d8462", "#d68ab9",
+                   "#a6a55d", 
+                   "#907030")
+
+phylum_colors_B <- c("#00767d", "#d38665", "#0d8462", "#d68ab9",
+                   "#31745c", "#8564a4", "#a6a55d", "#975657",
+                   "#656c4c", "#907030")
+```
+
+
+```{r}
+ld3_plot_new <- ld3_plot + 
+  scale_fill_manual(values = phylum_colors_L) 
+
+brm1_plot_new <- brm1_plot + 
+  scale_fill_manual(values = phylum_colors_B)
+
+plot_1day_new <- plot_grid(ld3_plot_new, brm1_plot_new,
+          nrow = 1, ncol = 2)
+plot_1day_new
+```
+
+Now we can see that the colors/phlya combinations are consistent between each panel, we can further clean up this plot by removing duplicate legends and axis labels. 
+```{r}
+# create a plot object just for the legend 
+leg_1day <- get_legend(brm1_plot + 
+  scale_fill_manual(values = phylum_colors_B))
+
+# set colors, remove legend
+ld3_plot_new <- ld3_plot + 
+  scale_fill_manual(values = phylum_colors_L) +
+  theme(legend.position = "none")
+# set colors, remove legend, hide y-axis label 
+brm1_plot_new <- brm1_plot + 
+  scale_fill_manual(values = phylum_colors_B) +
+  ylab(NULL) +
+  theme(legend.position = "none")
+
+# combine two figures, add legend, adjust widths
+plot_1day_new <- plot_grid(ld3_plot_new, brm1_plot_new, leg_1day, 
+          nrow = 1, ncol = 3,
+          rel_widths = c(1.5, 3.5, 1))
+plot_1day_new
+
+# save final plot 
+save_plot(plot_1day_new,
+          base_width = 12, base_height = 4,
+          filename = "figures/plot_1day_new.pdf")
+```
+
+### Practice 1
+Plot and save the BRMPS 1xdaily and 2xdaily figures side by side. Save as final plot as "brmps_barplot.pdf". 
+```{r}
+
+```
+
+### Practice 2
+Create a data frame from the phyloseq object created earlier that contains the weekly average relative abundace at the family level.
+```{r}
+
+```
+
+Create a stacked bar plot for participants who consumed BRMPS twice a day. Use facets two create a panel for each study week. 
+```{r}
+
+```
+
+# Alpha diversity
+
+There are numerous alpha diversity metrics, however we are going to focus on observed (richness) and Simpson (evenness) for our analyses. We will calculate, plot, extract information about alpha diversity with the plot_richness() funciton. 
+
+### Calculate richness
+Import sample data, format and filter data frame for samples in which we want to investigate the richness. 
+```{r}
+samp_data <- read_delim("raw_data/all_data_indv.txt", 
+                            delim = "\t", escape_double = FALSE, 
+                            trim_ws = TRUE, 
+                            col_types = cols(Bristol_numeric = col_number(),
+                                             Bristol_score = col_character(), 
+                                             pH = col_number())) %>% #import sample data again
+  rename_all(tolower) %>% #make all column names lower case
+  distinct(., sample_id, .keep_all = TRUE) %>%
+  select(participant_id, sample_number, sample_id, study_week, 
+         semester, supplement_consumed, frequency, quantity_compliant) %>% #drop extra columns 
+  filter(semester != "Winter2015",
+         quantity_compliant != "no",
+         study_week == "week1" | study_week == "week3",
+         supplement_consumed == "BRMPS" | supplement_consumed == "LOODAT")
+```
+
+Caculate richness
+```{r}
+richness_df <- physq_obj %>%
+  # calculate richness
+  estimate_richness(., split = TRUE,  measures = c("Observed")) %>% 
+  # make sample_id column before join 
+  rownames_to_column(var = "sample_id") %>% 
+  # join with sample data imported above
+  inner_join(samp_data, by = "sample_id") %>%  
+  rename(richness = Observed) %>%
+  # calculate average richness per person, per week 
+  group_by(participant_id, study_week, semester, 
+           frequency, supplement_consumed) %>%
+  summarise(avg_richness = round(mean(richness), digits = 0)) 
+
+richness_df
+```
+
+### Plot richness
+```{r}
+# Plot richness
+rich1 <- physq_obj %>%
+  plot_richness(., "study_week", measures = c("Observed")) +
+  facet_grid("supplement_consumed") +
+  ylab("Richness (Observed ESVs)") + xlab(NULL)
+rich1
+```
+
+This plot is pretty basic. Below we will update the plot with some of our preffered display settings. 
+```{r}
+rich1$layers <- rich1$layers[-1] #drop geom_point 
+
+rich2 <- rich1 +   
+  geom_violin(aes(color = study_week)) + #add violin in color
+  geom_jitter(aes(color = study_week)) +  #add individual points in color 
+  theme(legend.position = "none")
+rich2
+```
+
+### Statistical test
+We can use alpha diversity metrics (richness, evenness) in the same manner as any other measured characteristic. So, if we want to determine if the consumption of a LOODAT significantly richness we would use the data frame created in the section above to conduct a paired t-test. 
+```{r}
+# susbet for one supplement 
+rich_LD <- richness_df %>%
+  filter(supplement_consumed == "LOODAT")
+
+### check assumptions 
+# sample size
+rich_LD %>%
+  group_by(study_week) %>%
+  summarise(counts = n())
+
+# normality checks
+rich_wk1 <- rich_LD %>%
+  filter(study_week == "week1")
+rich_wk3 <- richness_df %>%
+  filter(study_week == "week3")
+shapiro.test(rich_wk1$avg_richness) #p-value = 0.4924
+shapiro.test(rich_wk3$avg_richness) # p-value = 0.6605
+# histogram and qqplot for normality checks
+ggplot(rich_wk1, aes(x=avg_richness)) +
+  geom_histogram() 
+qqnorm(rich_wk1$avg_richness); qqline(rich_wk1$avg_richness)
+ggplot(rich_wk3, aes(x=avg_richness)) +
+  geom_histogram() 
+qqnorm(rich_wk3$avg_richness); qqline(rich_wk3$avg_richness)
+```
+
+```{r}
+# format data for test
+rich_df_wide <- rich_LD %>%
+  spread(key = "study_week", value = "avg_richness") %>%
+  drop_na()
+
+# conduct test 
+wilcox.test(rich_df_wide$week1, rich_df_wide$week3, 
+            alternative = "two.sided", paired = TRUE) # p-value = 0.02531
+```
+
+Did you conclude the richness changed from week 1 to week 3 in individuals who consumped BRMPS?
+
+### Practice 3
+
+Create a plot that shows the richness across weeks 1 and 3 in participants who consumed BRMPS once and twice a day.
+```{r}
+
+```
+
+Conduct statistical tests to determine the if the richness was significantly different in participants who consumed BRMPS twice a day. 
+```{r}
+
+```
+
+Conduct statistical tests to determine the if the richness was significantly different in participants who consumed BRMPS once a day. 
+```{r}
+
+```
+
+
+# Beta diversity 
+
+Before calculating diversity indices (Bray-Curtis or Jaccard) we need to subset our read counts to an even depth. This means we have the same number of sequences reads in each sample. 
+```{r}
+# create a subset of the phyloseq object
+physq_sub <- physq_obj %>% 
+  subset_samples(., supplement_consumed == "BRMPS") %>%
+  subset_samples(., frequency == "2xdaily") %>%
+  prune_taxa(taxa_sums(.) > 1000, .) %>%
+  prune_samples(sample_sums(.) > 1000, .)
+
+# get read counts 
+sample_sum_df <- data.frame(sum = sample_sums(physq_sub))
+
+# Histogram of sample read counts
+ggplot(sample_sum_df, aes(x = sum)) + 
+  geom_histogram(color = "black", fill = "gray", binwidth = 2500) +
+  ggtitle("Distribution of sample sequencing depth") + 
+  xlab("Read counts") +
+  theme(axis.title.y = element_blank())
+
+# Summary statistics on read counts 
+min(sample_sums(physq_sub)) #1174
+mean(sample_sums(physq_sub)) #22810
+max(sample_sums(physq_sub))  #49192
+
+# scale samples to even depth using custom function
+physq_scale <- physq_sub %>%
+  scale_reads(round = "round") 
+```
+
+### Conduct ordination analysis
+
+This step calculates the diveristy index (using Bray Curtis in the example below), and does the ranking process of the diveristy indices to generate the information necessary to create a two-dimensional plot. Notice the arguments in the ordinate function; the index, Bray Curtis ("bray") or Jaccard ("jaccard"), is specified in the distance agurment, and with either of these metrics we will use method = "NMDS". The place were you might want to make some modifications is the k or number of dimensions (this should be somewhere between 1-3), the maximum number of iterations (depending on computer memory this can take several minutes to calculate), and the inital number of interations to try (100 in the example below). These can be modified to reduce the stress, with the goal of a number less than 0.20 (the lower the better). 
+
+
+```{r}
+# use ordinate function on subset 
+physq_bc <- ordinate(physq_scale, 
+           method = "NMDS", 
+           k=3, maxit=500, try=50,
+           distance = "bray")
+physq_bc
+```
+
+### Plot results
+
+For these plots we will use the phyloseq function plot_ordination() instead of ggplot(). Grouping variables can we assigned to color and shape, here they are differnet (study week and semester) but sometimes you may want them to be the same. 
+```{r}
+ordplot1 <- plot_ordination(physeq = physq_sub, 
+                     ordination = physq_bc, 
+                     type = "samples", 
+                     color = "study_week", 
+                     shape = "semester")
+print(ordplot1)
+```
+
+### Modify plots
+
+The phyloseq plot functions work nicely with ggplot layers. They can modified with ggplot functions you already know. The process to save these plots is the same, use save_plot(). 
+
+See this website for color options: http://sape.inf.usi.ch/quick-reference/ggplot2/colour 
+And this site for shape options: http://sape.inf.usi.ch/quick-reference/ggplot2/shape 
+```{r}
+ordplot2 <- plot_ordination(physeq = physq_sub, 
+                     ordination = physq_bc, 
+                     type = "samples", 
+                     color = "study_week", 
+                     shape = "study_week") +
+  # increase point size
+  geom_point(size=3) + 
+  # change default color palette 
+  scale_color_manual(name = "Study week",
+                     values = c("coral3", 
+                                "skyblue3"),
+                     labels = c("week 1",
+                                "week 3")) + 
+  # change default shapes
+  scale_shape_manual(name = "Study week",
+                     values = c(7, 8),
+                     labels = c("week 1", "week 3"))  
+print(ordplot2)
+```
+
+### Statistical test
+
+If you observe a pattern (separation of points from different groups) in your ordination plot, we can determine if that is to a significant level with analysis of similarities using distance matrices (ANOSIM or ADONIS). Using the ordination object from the section above, we run the test with the adonis() function, which is part of the vegan package. 
+```{r}
+# start with same phyloseq object as above 
+# calculate BC index, get distance matrix
+dat_bray <- phyloseq::distance(physq_sub, method = "bray") 
+
+sampledf <- physq_sub %>% 
+  sample_data(.) %>% #extract sample data from phyloseq object 
+  as(., "data.frame") #convert to data frame for adonis()
+
+# run test
+adn_res <- adonis(formula = dat_bray ~ study_week, 
+                  data = sampledf)
+
+# view results 
+print(adn_res)
+```
+
+Review the output from the adonis function, this format should be slightly familar to you now; we are interested in the R-squared (R2) and the p-value (Pr(>F)) columns. The p-value indicates the groups are statistically significant. The R-squared value can be interpretd as the effect size, it shows the percentage of variation explained by the grouping categories (here study week and semester). For this test, an R-squared value close to 1 indicaates dissimilarity between the groups, while an R value near 0 indicates no significant dissimilarity between the groups. 
+
+In our results above, the p-values of 0.001 indicate that the groupings of samples by study week is statistically significant. However, the R value of 0.00959 is fairly close to 0, indicating that the grouping of samples based by study week is weak. When this occurs (low p and low R), the variation of the samples in the tested groups likely is influencing the results of the test. 
+
+If communities are different between the two conditions being compared we would expect to see low p and high R. 
+
+
+### Practice 4
+Repeat the ordination plot and analysis as completed above, but use the Jaccard index instead of Bray-Curtis. Do your conclusions differ based on the index used? 
+```{r}
+# ordinate
+```
+
+```{r}
+# plot
+```
+
+```{r}
+# statistical test 
+```
+
+-----
+end
